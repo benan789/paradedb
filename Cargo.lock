@@ -4677,7 +4677,7 @@ dependencies = [
  "tantivy-bitpacker",
  "tantivy-columnar",
  "tantivy-common",
- "tantivy-fst 0.5.0 (git+https://github.com/paradedb/fst.git)",
+ "tantivy-fst 0.5.0",
  "tantivy-query-grammar",
  "tantivy-stacker",
  "tantivy-tokenizer-api",
@@ -4748,7 +4748,7 @@ source = "git+https://github.com/paradedb/tantivy.git?branch=main#febfba4ce2ce52
 dependencies = [
  "tantivy-bitpacker",
  "tantivy-common",
- "tantivy-fst 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tantivy-fst 0.5.0",
  "zstd 0.13.2",
 ]
 
