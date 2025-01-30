@@ -67,7 +67,7 @@ impl VisibilityChecker {
             let mut all_dead = false;
             let found = pg_sys::table_index_fetch_tuple(
                 self.scan,
-                &mut self.tid,
+                pg_sys::PointerGetDatum(&mut self.tid),
                 self.snapshot,
                 slot,
                 &mut call_again,
