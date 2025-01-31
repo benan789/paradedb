@@ -971,6 +971,19 @@ fn json_term(mut conn: PgConnection) {
     "
     .fetch(&mut conn);
     assert_eq!(rows, vec![(1,)]);
+
+    // Term set
+    let rows: Vec<(i32,)> = "
+        SELECT id FROM paradedb.bm25_search 
+        WHERE paradedb.bm25_search.id @@@ paradedb.term_set(
+            ARRAY[
+                paradedb.term('metadata.color', 'white'),
+                paradedb.term('metadata.attributes.score', 4)
+            ]
+        ) ORDER BY id
+    "
+    .fetch(&mut conn);
+    assert_eq!(rows, vec![(1,), (4,), (15,), (25,)]);
 }
 
 #[rstest]
@@ -1033,7 +1046,7 @@ fn json_phrase_prefix(mut conn: PgConnection) {
 }
 
 #[rstest]
-fn json_fuzzy_phrase(mut conn: PgConnection) {
+fn json_match(mut conn: PgConnection) {
     SimpleProductsTable::setup().execute(&mut conn);
     r#"
     UPDATE paradedb.bm25_search 
@@ -1044,7 +1057,7 @@ fn json_fuzzy_phrase(mut conn: PgConnection) {
 
     let rows: Vec<(i32,)> = "
     SELECT id FROM paradedb.bm25_search 
-    WHERE paradedb.bm25_search.id @@@ paradedb.fuzzy_phrase('metadata.attributes.review', 'realy godo') 
+    WHERE paradedb.bm25_search.id @@@ paradedb.match('metadata.attributes.review', 'realy godo', distance => 2) 
     ORDER BY id
     "
     .fetch(&mut conn);
