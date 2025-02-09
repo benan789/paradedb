@@ -26,7 +26,6 @@ jobs:
   benchmark-pg_search:
     name: Benchmark pg_search
     runs-on: ubicloud-standard-8
-    if: github.event.pull_request.draft == false
     strategy:
       matrix:
         pg_version: [17]
@@ -54,7 +53,7 @@ jobs:
           echo "version=$version" >> $GITHUB_OUTPUT
 
       - name: Install Rust Cache
-        uses: ubicloud/rust-cache@v2
+        uses: swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
           key: ${{ matrix.pg_version }}-${{ steps.pgrx.outputs.version }}
