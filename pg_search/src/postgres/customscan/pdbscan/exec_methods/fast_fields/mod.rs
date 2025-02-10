@@ -200,9 +200,17 @@ pub unsafe fn pullup_fast_fields(
                 }
 
                 attno => {
-                    let att = tupdesc
-                        .get((attno - 1) as usize)
-                        .expect("attnum should exist in tupdesc");
+                    let att = match tupdesc.get((attno - 1) as usize) {
+                        Some(att) => att,
+                        None => {
+                            ereport!(
+                                pg_sys::WARNING,
+                                message = format!("Attribute {} not found in tuple descriptor", attno)
+                            );
+                            return None;
+                        }
+                    };
+
                     if schema.is_fast_field(att.name()) {
                         let ff_type = if (*var).vartype == pg_sys::TEXTOID
                             || (*var).vartype == pg_sys::VARCHAROID
