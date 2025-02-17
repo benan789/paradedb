@@ -21,7 +21,7 @@ use crate::postgres::utils::{
     categorize_fields, item_pointer_to_u64, row_to_search_document, CategorizedFieldData,
 };
 use crate::schema::SearchField;
-use pgrx::{pg_guard, pg_sys, PgRelation, PgTupleDesc};
+use pgrx::{pg_guard, pg_sys, PgMemoryContexts, PgRelation, PgTupleDesc};
 use std::ffi::CStr;
 use std::panic::{catch_unwind, resume_unwind};
 
@@ -30,9 +30,12 @@ extern "C" {
 }
 
 pub struct InsertState {
+    #[allow(dead_code)] // field is used by pg<16 for the fakeaminsertcleanup stuff
+    pub indexrelid: pg_sys::Oid,
     pub writer: Option<SearchIndexWriter>,
     categorized_fields: Vec<(SearchField, CategorizedFieldData)>,
     key_field_name: String,
+    per_row_context: PgMemoryContexts,
 }
 
 impl InsertState {
@@ -44,10 +47,21 @@ impl InsertState {
         let tupdesc = unsafe { PgTupleDesc::from_pg_unchecked(indexrel.rd_att) };
         let categorized_fields = categorize_fields(&tupdesc, &writer.schema);
         let key_field_name = writer.schema.key_field().name.0;
+
+        let per_row_context = pg_sys::AllocSetContextCreateExtended(
+            PgMemoryContexts::CurrentMemoryContext.value(),
+            c"pg_search aminsert context".as_ptr(),
+            pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
+        );
+
         Ok(Self {
+            indexrelid: indexrel.oid(),
             writer: Some(writer),
             categorized_fields,
             key_field_name,
+            per_row_context: PgMemoryContexts::For(per_row_context),
         })
     }
 }
@@ -58,23 +72,18 @@ unsafe fn init_insert_state(
     index_info: &mut pg_sys::IndexInfo,
     writer_resources: WriterResources,
 ) -> &'static mut InsertState {
-    use crate::postgres::fake_aminsertcleanup::{
-        get_pending_insert_state, reset_pending_insert_state, set_pending_insert_state,
-    };
+    use crate::postgres::fake_aminsertcleanup::{get_insert_state, push_insert_state};
 
     if index_info.ii_AmCache.is_null() {
         let index_relation = PgRelation::from_pg(index_relation);
         let state = InsertState::new(&index_relation, writer_resources)
             .expect("should be able to open new SearchIndex for writing");
 
-        set_pending_insert_state(state);
+        push_insert_state(state);
         index_info.ii_AmCache = &true as *const _ as *mut _; // a pointer to `true` to indicate that we've set up the InsertState
-        pgrx::register_xact_callback(pgrx::PgXactCallbackEvent::Abort, || {
-            reset_pending_insert_state()
-        });
     }
 
-    get_pending_insert_state().expect("should have a pending insert state")
+    get_insert_state((*index_relation).rd_id).expect("should have a pending insert state")
 }
 
 #[cfg(feature = "pg17")]
@@ -153,29 +162,35 @@ unsafe fn aminsert_internal(
                 .expect("index_info argument must not be null"),
             WriterResources::Statement,
         );
-        let categorized_fields = &state.categorized_fields;
-        let key_field_name = &state.key_field_name;
-        let writer = state.writer.as_mut().expect("writer should not be null");
 
-        let mut search_document = writer.schema.new_document();
+        state.per_row_context.switch_to(|cxt| {
+            let categorized_fields = &state.categorized_fields;
+            let key_field_name = &state.key_field_name;
+            let writer = state.writer.as_mut().expect("writer should not be null");
 
-        row_to_search_document(
-            values,
-            isnull,
-            key_field_name,
-            categorized_fields,
-            &mut search_document,
-        )
-        .unwrap_or_else(|err| {
-            panic!(
-                "error creating index entries for index '{}': {err}",
-                CStr::from_ptr((*(*index_relation).rd_rel).relname.data.as_ptr()).to_string_lossy()
-            );
-        });
-        writer
-            .insert(search_document, item_pointer_to_u64(*ctid))
-            .expect("insertion into index should succeed");
-        true
+            let mut search_document = writer.schema.new_document();
+
+            row_to_search_document(
+                values,
+                isnull,
+                key_field_name,
+                categorized_fields,
+                &mut search_document,
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "error creating index entries for index '{}': {err}",
+                    CStr::from_ptr((*(*index_relation).rd_rel).relname.data.as_ptr())
+                        .to_string_lossy()
+                );
+            });
+            writer
+                .insert(search_document, item_pointer_to_u64(*ctid))
+                .expect("insertion into index should succeed");
+
+            cxt.reset();
+            true
+        })
     });
 
     match result {
