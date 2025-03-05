@@ -163,15 +163,13 @@ impl TantivyValue {
         // inserted into the index. Therefore, we need to flatten the array elements
         // individually before converting them into Tantivy values.
         if oid.is_coercible_to(PgBuiltInOids::JSONBOID) {
-            let pgrx_value =
-                pgrx::JsonB::from_datum(datum, false).ok_or(TantivyValueError::DatumDeref)?;
-            let json_value: Value = serde_json::from_slice(&serde_json::to_vec(&pgrx_value.0)?)?;
-            Ok(Self::json_value_to_tantivy_value(json_value))
+            let pgrx_value = pgrx::JsonB::from_datum(datum, false)
+                .ok_or(TantivyValueError::DatumDeref)?;
+            Ok(Self::json_value_to_tantivy_value(pgrx_value.0))
         } else if oid.is_coercible_to(PgBuiltInOids::JSONOID) {
-            let pgrx_value =
-                pgrx::Json::from_datum(datum, false).ok_or(TantivyValueError::DatumDeref)?;
-            let json_value: Value = serde_json::from_slice(&serde_json::to_vec(&pgrx_value.0)?)?;
-            Ok(Self::json_value_to_tantivy_value(json_value))
+            let pgrx_value = pgrx::Json::from_datum(datum, false)
+                .ok_or(TantivyValueError::DatumDeref)?;
+            Ok(Self::json_value_to_tantivy_value(pgrx_value.0))
         } else if matches!(oid, PgOid::BuiltIn(_)) {
             // Any other built-in type is not supported as JSON.
             Err(TantivyValueError::UnsupportedJsonOid(oid.value()))
