@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -15,6 +15,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+use crate::postgres::storage::buffer::BufferManager;
+use pgrx::pg_sys::BlockNumber;
 use pgrx::*;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
@@ -31,28 +33,25 @@ pub const SCHEMA_START: pg_sys::BlockNumber = 2;
 pub const SETTINGS_START: pg_sys::BlockNumber = 4;
 pub const SEGMENT_METAS_START: pg_sys::BlockNumber = 6;
 
+// keep this sorted, please
+// and update it if a new hardcoded block number is added in the future
+pub const FIXED_BLOCK_NUMBERS: [pg_sys::BlockNumber; 5] = [
+    MERGE_LOCK,
+    CLEANUP_LOCK,
+    SCHEMA_START,
+    SETTINGS_START,
+    SEGMENT_METAS_START,
+];
+
 // ---------------------------------------------------------
 // BM25 page special data
 // ---------------------------------------------------------
 
 // Struct for all page's LP_SPECIAL data
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BM25PageSpecialData {
     pub next_blockno: pg_sys::BlockNumber,
     pub xmax: pg_sys::TransactionId,
-}
-
-// ---------------------------------------------------------
-// Merge lock
-// ---------------------------------------------------------
-
-#[derive(Debug, Copy, Clone)]
-#[repr(C, packed)]
-pub struct MergeLockData {
-    pub last_merge: pg_sys::TransactionId,
-
-    #[allow(dead_code)]
-    pub _dead_space: u32,
 }
 
 // ---------------------------------------------------------
@@ -186,6 +185,48 @@ impl SegmentMetaEntry {
             .unwrap_or(0)
     }
 
+    pub fn file_entry(&self, path: &Path) -> Option<FileEntry> {
+        for (file_path, (file_entry, _)) in self.get_component_paths().zip(self.file_entries()) {
+            if path == file_path {
+                return Some(*file_entry);
+            }
+        }
+        None
+    }
+
+    pub fn file_entries(&self) -> impl Iterator<Item = (&FileEntry, SegmentComponent)> {
+        self.postings
+            .iter()
+            .map(|fe| (fe, SegmentComponent::Postings))
+            .chain(
+                self.positions
+                    .iter()
+                    .map(|fe| (fe, SegmentComponent::Positions)),
+            )
+            .chain(
+                self.fast_fields
+                    .iter()
+                    .map(|fe| (fe, SegmentComponent::FastFields)),
+            )
+            .chain(
+                self.field_norms
+                    .iter()
+                    .map(|fe| (fe, SegmentComponent::FieldNorms)),
+            )
+            .chain(self.terms.iter().map(|fe| (fe, SegmentComponent::Terms)))
+            .chain(self.store.iter().map(|fe| (fe, SegmentComponent::Store)))
+            .chain(
+                self.temp_store
+                    .iter()
+                    .map(|fe| (fe, SegmentComponent::TempStore)),
+            )
+            .chain(
+                self.delete
+                    .as_ref()
+                    .map(|d| (&d.file_entry, SegmentComponent::Delete)),
+            )
+    }
+
     pub fn byte_size(&self) -> u64 {
         let mut size = 0;
 
@@ -232,68 +273,19 @@ impl SegmentMetaEntry {
         size
     }
 
-    pub fn get_component_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::with_capacity(8);
-
+    pub fn get_component_paths(&self) -> impl Iterator<Item = PathBuf> + '_ {
         let uuid = self.segment_id.uuid_string();
-        if self.postings.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::Postings
-            )));
-        }
-        if self.positions.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::Positions
-            )));
-        }
-        if self.fast_fields.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::FastFields
-            )));
-        }
-        if self.field_norms.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::FieldNorms
-            )));
-        }
-        if self.terms.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::Terms
-            )));
-        }
-        if self.store.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::Store
-            )));
-        }
-        if self.temp_store.is_some() {
-            paths.push(PathBuf::from(format!(
-                "{}.{}",
-                uuid,
-                SegmentComponent::TempStore
-            )));
-        }
-        if let Some(_entry) = &self.delete {
-            paths.push(PathBuf::from(format!(
-                "{}.0.{}", // we can hardcode zero as the opstamp component of the path as it's not used by anyone
-                uuid,
-                SegmentComponent::Delete
-            )));
-        }
-
-        paths
+        self.file_entries().map(move |(_, component)| {
+            if matches!(component, SegmentComponent::Delete) {
+                PathBuf::from(format!(
+                    "{}.0.{}", // we can hardcode zero as the opstamp component of the path as it's not used by anyone
+                    uuid,
+                    SegmentComponent::Delete
+                ))
+            } else {
+                PathBuf::from(format!("{uuid}.{component}"))
+            }
+        })
     }
 }
 
@@ -331,20 +323,7 @@ impl From<PgItem> for SegmentMetaEntry {
 impl SegmentMetaEntry {
     /// Fake an opstamp value based on our internal `xmin` and `xmax` values
     pub fn opstamp(&self) -> Opstamp {
-        ((self.xmax as u64) << 32) | (self.xmin as u64)
-    }
-
-    pub fn get_file_entry(&self, segment_component: SegmentComponent) -> Option<FileEntry> {
-        match segment_component {
-            SegmentComponent::Postings => self.postings,
-            SegmentComponent::Positions => self.positions,
-            SegmentComponent::FastFields => self.fast_fields,
-            SegmentComponent::FieldNorms => self.field_norms,
-            SegmentComponent::Terms => self.terms,
-            SegmentComponent::Store => self.store,
-            SegmentComponent::TempStore => self.temp_store,
-            SegmentComponent::Delete => self.delete.map(|entry| entry.file_entry),
-        }
+        self.xmin.max(self.xmax) as Opstamp // ((self.xmax as u64) << 32) | (self.xmin as u64)
     }
 }
 
@@ -381,6 +360,8 @@ pub trait MVCCEntry {
     fn get_xmax(&self) -> pg_sys::TransactionId;
     fn into_frozen(self, should_freeze_xmin: bool, should_freeze_xmax: bool) -> Self;
 
+    fn pintest_blockno(&self) -> pg_sys::BlockNumber;
+
     // Provided methods
     unsafe fn visible(&self, snapshot: pg_sys::Snapshot) -> bool {
         let xmin = self.get_xmin();
@@ -393,29 +374,33 @@ pub trait MVCCEntry {
         xmin_visible && !deleted
     }
 
-    unsafe fn recyclable(
-        &self,
-        snapshot: pg_sys::Snapshot,
-        heap_relation: pg_sys::Relation,
-    ) -> bool {
+    unsafe fn recyclable(&self, bman: &mut BufferManager) -> bool {
         let xmax = self.get_xmax();
         if xmax == pg_sys::InvalidTransactionId {
             return false;
         }
 
-        if pg_sys::XidInMVCCSnapshot(xmax, snapshot) {
-            return false;
-        }
+        // if the xmax transaction is no longer in progress
+        !pg_sys::TransactionIdIsInProgress(xmax)
 
-        #[cfg(feature = "pg13")]
-        {
-            pg_sys::TransactionIdPrecedes(xmax, pg_sys::RecentGlobalXmin)
+        // and there's no pin on our pintest buffer, assuming we have a valid buffer
+        && {
+            self.pintest_blockno() == pg_sys::InvalidBlockNumber
+                || bman.get_buffer_for_cleanup_conditional(self.pintest_blockno()).is_some()
         }
+    }
 
-        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
-        {
-            pg_sys::GlobalVisCheckRemovableXid(heap_relation, xmax)
-        }
+    unsafe fn mergeable(&self) -> bool {
+        let xmin = self.get_xmin();
+        let xmax = self.get_xmax();
+
+        // mergeable if we haven't deleted it
+        xmax == pg_sys::InvalidTransactionId
+
+            // and it's from a transaction that is not in progress.  we can't merge segments created
+            // by *this* transaction (ie, xmin == GetCurrentTransactionId()) because this transaction
+            // is considered in progress
+        && (!pg_sys::TransactionIdIsInProgress(xmin))
     }
 
     unsafe fn xmin_needs_freeze(&self, freeze_limit: pg_sys::TransactionId) -> bool {
@@ -449,6 +434,13 @@ impl MVCCEntry for SegmentMetaEntry {
                 self.xmax
             },
             ..self
+        }
+    }
+
+    fn pintest_blockno(&self) -> BlockNumber {
+        match self.file_entries().next() {
+            None => panic!("SegmentMetaEntry for `{}` has no files", self.segment_id),
+            Some((file_entry, _)) => file_entry.starting_block,
         }
     }
 }

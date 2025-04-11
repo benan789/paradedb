@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -15,15 +15,16 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use std::collections::HashMap;
-
-use crate::index::merge_policy::MergeLock;
+use crate::index::merge_policy::LayeredMergePolicy;
+use crate::index::mvcc::MvccSatisfies;
 use crate::index::reader::index::SearchIndexReader;
-use crate::index::BlockDirectoryType;
+use crate::postgres::index::IndexKind;
+use crate::postgres::insert::merge_index_with_policy;
 use crate::postgres::options::SearchIndexCreateOptions;
 use crate::postgres::storage::block::{
     LinkedList, MVCCEntry, SegmentMetaEntry, SEGMENT_METAS_START,
 };
+use crate::postgres::storage::merge::MergeLock;
 use crate::postgres::storage::LinkedItemList;
 use crate::postgres::utils::item_pointer_to_u64;
 use crate::query::SearchQueryInput;
@@ -36,6 +37,7 @@ use pgrx::JsonB;
 use pgrx::PgRelation;
 use rustc_hash::FxHashMap;
 use serde_json::Value;
+use std::collections::HashSet;
 
 #[allow(clippy::too_many_arguments)]
 #[pg_extern]
@@ -120,6 +122,79 @@ pub unsafe fn index_fields(index: PgRelation) -> anyhow::Result<JsonB> {
     Ok(JsonB(serde_json::to_value(name_and_config)?))
 }
 
+#[pg_extern]
+pub unsafe fn layer_sizes(index: PgRelation) -> Vec<AnyNumeric> {
+    let options = SearchIndexCreateOptions::from_relation(&index);
+    options
+        .layer_sizes(crate::postgres::insert::DEFAULT_LAYER_SIZES)
+        .into_iter()
+        .map(|layer_size| layer_size.into())
+        .collect()
+}
+
+#[pg_extern]
+unsafe fn merge_info(
+    index: PgRelation,
+) -> TableIterator<
+    'static,
+    (
+        name!(index_name, String),
+        name!(pid, i32),
+        name!(xmin, AnyNumeric),
+        name!(xmax, AnyNumeric),
+        name!(segno, String),
+    ),
+> {
+    let index_kind = IndexKind::for_index(index).unwrap();
+
+    let mut result = Vec::new();
+    for index in index_kind.partitions() {
+        let merge_lock = MergeLock::acquire(index.oid());
+        let merge_entries = merge_lock.in_progress_merge_entries();
+        result.extend(merge_entries.into_iter().flat_map(move |merge_entry| {
+            let index_name = index.name().to_owned();
+            merge_entry
+                .segment_ids(index.oid())
+                .into_iter()
+                .map(move |segment_id| {
+                    (
+                        index_name.clone(),
+                        merge_entry.pid,
+                        merge_entry.xmin.into(),
+                        merge_entry.xmax.into(),
+                        segment_id.short_uuid_string(),
+                    )
+                })
+        }));
+    }
+    TableIterator::new(result)
+}
+
+/// Deprecated: Use `paradedb.merge_info` instead.
+#[pg_extern]
+fn is_merging(index: PgRelation) -> bool {
+    unsafe { merge_info(index).next().is_some() }
+}
+
+#[pg_extern]
+unsafe fn vacuum_info(
+    index: PgRelation,
+) -> TableIterator<'static, (name!(index_name, String), name!(segno, String))> {
+    let index_kind = IndexKind::for_index(index).unwrap();
+
+    let mut result = Vec::new();
+    for index in index_kind.partitions() {
+        let mut merge_lock = MergeLock::acquire(index.oid());
+        let vacuum_list = merge_lock.list_vacuuming_segments();
+        result.extend(
+            vacuum_list
+                .iter()
+                .map(|segment_id| (index.name().to_owned(), segment_id.short_uuid_string())),
+        );
+    }
+    TableIterator::new(result)
+}
+
 #[allow(clippy::type_complexity)]
 #[pg_extern]
 fn index_info(
@@ -129,6 +204,7 @@ fn index_info(
     TableIterator<
         'static,
         (
+            name!(index_name, String),
             name!(visible, bool),
             name!(recyclable, bool),
             name!(xmin, AnyNumeric),
@@ -156,85 +232,42 @@ fn index_info(
     // validated the existence of the relation. We are safe calling the function below as
     // long we do not pass pg_sys::NoLock without any other locking mechanism of our own.
     let index = unsafe { PgRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _) };
-    let heap = index
-        .heap_relation()
-        .expect("index must have a heap relation");
+    let index_kind = IndexKind::for_index(index)?;
 
-    // open the specified index
-    let search_index = SearchIndexReader::open(&index, BlockDirectoryType::Mvcc, false)?;
-    let mut search_readers = search_index
-        .segment_readers()
-        .iter()
-        .map(|segment_reader| (segment_reader.segment_id(), segment_reader))
-        .collect::<HashMap<_, _>>();
-    let all_entries = unsafe {
-        LinkedItemList::<SegmentMetaEntry>::open(index.oid(), SEGMENT_METAS_START)
-            .list()
-            .into_iter()
-            .map(|entry| (entry.segment_id, entry))
-            .collect::<HashMap<_, _>>()
-    };
-
-    let snapshot = unsafe { pg_sys::GetActiveSnapshot() };
     let mut results = Vec::new();
-    for (segment_id, entry) in all_entries {
-        if !show_invisible && unsafe { !entry.visible(snapshot) } {
-            continue;
+    for index in index_kind.partitions() {
+        // open the specified index
+        let mut segment_components =
+            LinkedItemList::<SegmentMetaEntry>::open(index.oid(), SEGMENT_METAS_START);
+        let all_entries = unsafe { segment_components.list() };
+
+        let snapshot = unsafe { pg_sys::GetActiveSnapshot() };
+        for entry in all_entries {
+            if !show_invisible && unsafe { !entry.visible(snapshot) } {
+                continue;
+            }
+            results.push((
+                index.name().to_owned(),
+                unsafe { entry.visible(snapshot) },
+                unsafe { entry.recyclable(segment_components.bman_mut()) },
+                entry.xmin.into(),
+                entry.xmax.into(),
+                entry.segment_id.short_uuid_string(),
+                Some(entry.byte_size().into()),
+                Some(entry.num_docs().into()),
+                Some(entry.num_deleted_docs().into()),
+                entry.terms.map(|file| file.total_bytes.into()),
+                entry.postings.map(|file| file.total_bytes.into()),
+                entry.positions.map(|file| file.total_bytes.into()),
+                entry.fast_fields.map(|file| file.total_bytes.into()),
+                entry.field_norms.map(|file| file.total_bytes.into()),
+                entry.store.map(|file| file.total_bytes.into()),
+                entry.delete.map(|file| file.file_entry.total_bytes.into()),
+            ));
         }
-        let segment_reader = search_readers.remove(&segment_id);
-        let space_usage = segment_reader.map(|reader| {
-            reader
-                .space_usage()
-                .expect("should be able to get space usage")
-        });
-        let space_usage = space_usage.as_ref();
-        results.push((
-            unsafe { entry.visible(snapshot) },
-            unsafe { entry.recyclable(snapshot, heap.as_ptr()) },
-            entry.xmin.into(),
-            entry.xmax.into(),
-            segment_id.short_uuid_string(),
-            space_usage
-                .map(|usage| usage.total().get_bytes().into())
-                .or_else(|| Some(entry.byte_size().into())),
-            segment_reader
-                .map(|reader| reader.num_docs().into())
-                .or_else(|| Some(entry.num_docs().into())),
-            segment_reader
-                .map(|reader| reader.num_deleted_docs().into())
-                .or_else(|| Some(entry.num_deleted_docs().into())),
-            space_usage
-                .map(|usage| usage.termdict().total().get_bytes().into())
-                .or_else(|| entry.terms.map(|file| file.total_bytes.into())),
-            space_usage
-                .map(|usage| usage.postings().total().get_bytes().into())
-                .or_else(|| entry.postings.map(|file| file.total_bytes.into())),
-            space_usage
-                .map(|usage| usage.positions().total().get_bytes().into())
-                .or_else(|| entry.positions.map(|file| file.total_bytes.into())),
-            space_usage
-                .map(|usage| usage.fast_fields().total().get_bytes().into())
-                .or_else(|| entry.fast_fields.map(|file| file.total_bytes.into())),
-            space_usage
-                .map(|usage| usage.fieldnorms().total().get_bytes().into())
-                .or_else(|| entry.field_norms.map(|file| file.total_bytes.into())),
-            space_usage
-                .map(|usage| usage.store().total().get_bytes().into())
-                .or_else(|| entry.store.map(|file| file.total_bytes.into())),
-            space_usage
-                .map(|usage| usage.deletes().get_bytes().into())
-                .or_else(|| entry.delete.map(|file| file.file_entry.total_bytes.into())),
-        ));
     }
 
-    assert!(search_readers.is_empty());
-
     Ok(TableIterator::new(results))
-}
-
-#[pg_extern]
-fn is_merging(index: PgRelation) -> bool {
-    unsafe { MergeLock::acquire_for_merge(index.oid()).is_none() }
 }
 
 /// Returns the list of segments that contain the specified [`pg_sys::ItemPointerData]` heap tuple
@@ -249,7 +282,7 @@ fn is_merging(index: PgRelation) -> bool {
 fn find_ctid(index: PgRelation, ctid: pg_sys::ItemPointerData) -> Result<Option<Vec<String>>> {
     let index = unsafe { PgRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _) };
 
-    let search_index = SearchIndexReader::open(&index, BlockDirectoryType::Mvcc, true)?;
+    let search_index = SearchIndexReader::open(&index, MvccSatisfies::Snapshot)?;
     let ctid_u64 = item_pointer_to_u64(ctid);
     let results = search_index.search(
         false,
@@ -271,12 +304,11 @@ fn find_ctid(index: PgRelation, ctid: pg_sys::ItemPointerData) -> Result<Option<
         .collect::<Vec<_>>();
 
     if results.is_empty() {
-        pgrx::warning!(
+        panic!(
             "find_ctid: didn't find segment for: {:?}.  segments={:#?}",
             pgrx::itemptr::item_pointer_get_both(ctid),
             search_index.segment_ids()
         );
-        Ok(None)
     } else {
         Ok(Some(results))
     }
@@ -295,7 +327,7 @@ fn validate_checksum(index: PgRelation) -> Result<SetOfIterator<'static, String>
     let index = unsafe { PgRelation::with_lock(index.oid(), pg_sys::AccessShareLock as _) };
 
     // open the specified index
-    let search_reader = SearchIndexReader::open(&index, BlockDirectoryType::Mvcc, false)?;
+    let search_reader = SearchIndexReader::open(&index, MvccSatisfies::Snapshot)?;
 
     let failed = search_reader.validate_checksum()?;
     Ok(SetOfIterator::new(
@@ -345,9 +377,9 @@ fn page_info(
         ),
     >,
 > {
-    let segment_components =
+    let mut segment_components =
         LinkedItemList::<SegmentMetaEntry>::open(index.oid(), SEGMENT_METAS_START);
-    let bman = segment_components.bman();
+    let bman = segment_components.bman_mut();
     let buffer = bman.get_buffer(blockno as pg_sys::BlockNumber);
     let page = buffer.page();
     let max_offset = page.max_offset_number();
@@ -363,12 +395,12 @@ fn page_info(
 
     for offsetno in pg_sys::FirstOffsetNumber..=max_offset {
         unsafe {
-            if let Some((entry, size)) = page.read_item::<SegmentMetaEntry>(offsetno) {
+            if let Some((entry, size)) = page.deserialize_item::<SegmentMetaEntry>(offsetno) {
                 data.push((
                     offsetno as i32,
                     size as i32,
                     entry.visible(snapshot),
-                    entry.recyclable(snapshot, heap_relation),
+                    entry.recyclable(bman),
                     JsonB(serde_json::to_value(entry)?),
                 ))
             } else {
@@ -406,3 +438,110 @@ fn version_info() -> TableIterator<
 
     TableIterator::once((version, git_sha, build_mode))
 }
+
+#[pg_extern(name = "force_merge")]
+fn force_merge_pretty_bytes(
+    index: PgRelation,
+    oversized_layer_size_pretty: String,
+) -> anyhow::Result<TableIterator<'static, (name!(new_segments, i64), name!(merged_segments, i64))>>
+{
+    let byte_size = unsafe {
+        pgrx::direct_function_call::<i64>(
+            pg_sys::pg_size_bytes,
+            &[oversized_layer_size_pretty.into_datum()],
+        )
+        .expect("pg_size_bytes should not return null")
+    };
+
+    force_merge_raw_bytes(index, byte_size)
+}
+
+#[pg_extern(name = "force_merge")]
+fn force_merge_raw_bytes(
+    index: PgRelation,
+    oversized_layer_size_bytes: i64,
+) -> anyhow::Result<TableIterator<'static, (name!(new_segments, i64), name!(merged_segments, i64))>>
+{
+    let index = unsafe {
+        let oid = index.oid();
+        drop(index);
+
+        // reopen the index with a RowExclusiveLock b/c we are going to be changing its physical structure
+        PgRelation::with_lock(oid, pg_sys::RowExclusiveLock as _)
+    };
+
+    let merge_policy = LayeredMergePolicy::new(vec![oversized_layer_size_bytes.try_into()?]);
+    let (ncandidates, nmerged) =
+        unsafe { merge_index_with_policy(index, merge_policy, true, true) };
+    Ok(TableIterator::once((
+        ncandidates.try_into()?,
+        nmerged.try_into()?,
+    )))
+}
+
+#[pg_extern]
+fn merge_lock_garbage_collect(index: PgRelation) -> SetOfIterator<'static, i32> {
+    unsafe {
+        let mut merge_lock = MergeLock::acquire(index.oid());
+        let before = merge_lock.in_progress_merge_entries();
+        merge_lock.garbage_collect();
+        let after = merge_lock.in_progress_merge_entries();
+        drop(merge_lock);
+
+        let before_pids = before
+            .into_iter()
+            .map(|entry| entry.pid)
+            .collect::<HashSet<_>>();
+        let after_pids = after
+            .into_iter()
+            .map(|entry| entry.pid)
+            .collect::<HashSet<_>>();
+        let mut garbage_collected_pids = before_pids
+            .difference(&after_pids)
+            .copied()
+            .collect::<Vec<_>>();
+        garbage_collected_pids.sort_unstable();
+        SetOfIterator::new(garbage_collected_pids)
+    }
+}
+
+extension_sql!(
+    r#"create view paradedb.index_layer_info as
+select relname::text,
+       layer_size,
+       low,
+       high,
+       byte_size,
+       case when segments = ARRAY [NULL] then 0 else count end       as count,
+       case when segments = ARRAY [NULL] then NULL else segments end as segments
+from (select relname,
+             coalesce(pg_size_pretty(case when low = 0 then null else low end), '') || '..' ||
+             coalesce(pg_size_pretty(case when high = 9223372036854775807 then null else high end), '') as layer_size,
+             count(*),
+             coalesce(sum(byte_size), 0)                                                                as byte_size,
+             min(low)                                                                                   as low,
+             max(high)                                                                                  as high,
+             array_agg(segno)                                                                           as segments
+      from (with indexes as (select oid::regclass as relname
+                             from pg_class
+                             where relam = (select oid from pg_am where amname = 'bm25')),
+                 segments as (select relname, index_info.*
+                              from indexes
+                                       inner join paradedb.index_info(indexes.relname, true) on true),
+                 layer_sizes as (select relname, coalesce(lead(unnest) over (), 0) low, unnest as high
+                                 from indexes
+                                          inner join lateral (select unnest(0 || paradedb.layer_sizes(indexes.relname) || 9223372036854775807)
+                                                              order by 1 desc) x on true)
+            select layer_sizes.relname, layer_sizes.low, layer_sizes.high, segments.segno, segments.byte_size
+            from layer_sizes
+                     left join segments on layer_sizes.relname = segments.relname and
+                                           (byte_size * 1.33)::bigint between low and high) x
+      where low < high
+      group by relname, low, high
+      order by relname, low desc) x;
+      
+GRANT SELECT ON paradedb.index_layer_info TO PUBLIC;
+"#,
+    name = "index_layer_info",
+    requires = [index_info, layer_sizes]
+);

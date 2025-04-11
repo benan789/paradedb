@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -18,6 +18,7 @@
 use crate::index::reader::index::SearchIndexReader;
 use crate::postgres::ParallelScanState;
 use pgrx::{pg_guard, pg_sys};
+use std::collections::HashSet;
 use std::ptr::addr_of_mut;
 use tantivy::index::SegmentId;
 
@@ -71,7 +72,7 @@ pub unsafe extern "C" fn aminitparallelscan(target: *mut ::core::ffi::c_void) {
 #[pg_guard]
 pub unsafe extern "C" fn amparallelrescan(_scan: pg_sys::IndexScanDesc) {}
 
-#[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15", feature = "pg16"))]
+#[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
 #[pg_guard]
 pub unsafe extern "C" fn amestimateparallelscan() -> pg_sys::Size {
     ParallelScanState::size_of(u16::MAX as usize, &[])
@@ -130,6 +131,10 @@ pub unsafe fn maybe_claim_segment(scan: pg_sys::IndexScanDesc) -> Option<Segment
         let remaining_segments = state.decrement_remaining_segments();
         Some(state.segment_id(remaining_segments))
     }
+}
+
+pub unsafe fn list_segment_ids(scan: pg_sys::IndexScanDesc) -> Option<HashSet<SegmentId>> {
+    Some(get_bm25_scan_state(&scan)?.segments())
 }
 
 fn get_bm25_scan_state(scan: &pg_sys::IndexScanDesc) -> Option<&mut ParallelScanState> {

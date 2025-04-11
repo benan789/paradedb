@@ -42,7 +42,7 @@ ENV PATH="/usr/local/bin:/root/.cargo/bin:$PATH" \
 # Copy project because we need to extract the pgrx version
 COPY . /tmp/
 
-# Install the pgrx version of pg_search, pg_analytics and pg_parquet
+# Install the pgrx version of pg_search
 WORKDIR /tmp/
 RUN PGRX_VERSION=$(cargo tree --depth 1 -i pgrx -p pg_search | head -n 1 | sed -E 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/') && \
     echo "PGRX_VERSION=$PGRX_VERSION" && \
@@ -56,18 +56,12 @@ RUN PGRX_VERSION=$(cargo tree --depth 1 -i pgrx -p pg_search | head -n 1 | sed -
 
 FROM builder AS builder-pg_search
 
-ARG POSTHOG_API_KEY
-ARG POSTHOG_HOST
 ARG COMMIT_SHA
 ARG PARADEDB_VERSION
-ARG PARADEDB_TELEMETRY
 
 # Declare compile-time environment variables
-ENV POSTHOG_API_KEY=${POSTHOG_API_KEY} \
-    POSTHOG_HOST=${POSTHOG_HOST} \
-    COMMIT_SHA=${COMMIT_SHA} \
-    PARADEDB_VERSION=${PARADEDB_VERSION} \
-    PARADEDB_TELEMETRY=${PARADEDB_TELEMETRY}
+ENV COMMIT_SHA=${COMMIT_SHA} \
+    PARADEDB_VERSION=${PARADEDB_VERSION}
 
 COPY . /tmp/
 
@@ -88,56 +82,6 @@ RUN ./runConfigureICU Linux --prefix=/usr/local && \
 # Build the extension
 WORKDIR /tmp/pg_search
 RUN cargo pgrx package --features icu --pg-config "/usr/lib/postgresql/${PG_VERSION_MAJOR}/bin/pg_config"
-
-######################
-# pg_analytics
-######################
-
-FROM builder AS builder-pg_analytics
-
-ARG POSTHOG_API_KEY
-ARG POSTHOG_HOST
-ARG COMMIT_SHA
-ARG PARADEDB_VERSION
-ARG PARADEDB_TELEMETRY
-
-# Declare compile-time environment variables
-ENV POSTHOG_API_KEY=${POSTHOG_API_KEY} \
-    POSTHOG_HOST=${POSTHOG_HOST} \
-    COMMIT_SHA=${COMMIT_SHA} \
-    PARADEDB_VERSION=${PARADEDB_VERSION} \
-    PARADEDB_TELEMETRY=${PARADEDB_TELEMETRY}
-
-RUN git clone --branch v0.3.5 https://github.com/paradedb/pg_analytics.git /tmp/pg_analytics/
-
-# Build the extension
-WORKDIR /tmp/pg_analytics
-RUN cargo pgrx package --pg-config "/usr/lib/postgresql/${PG_VERSION_MAJOR}/bin/pg_config"
-
-######################
-# pg_parquet
-######################
-
-FROM builder AS builder-pg_parquet
-
-ARG POSTHOG_API_KEY
-ARG POSTHOG_HOST
-ARG COMMIT_SHA
-ARG PARADEDB_VERSION
-ARG PARADEDB_TELEMETRY
-
-# Declare compile-time environment variables
-ENV POSTHOG_API_KEY=${POSTHOG_API_KEY} \
-    POSTHOG_HOST=${POSTHOG_HOST} \
-    COMMIT_SHA=${COMMIT_SHA} \
-    PARADEDB_VERSION=${PARADEDB_VERSION} \
-    PARADEDB_TELEMETRY=${PARADEDB_TELEMETRY}
-
-RUN git clone --branch pgrx-0.13.0 https://github.com/paradedb/pg_parquet.git /tmp/pg_parquet/
-
-# Build the extension
-WORKDIR /tmp/pg_parquet
-RUN cargo pgrx package --pg-config "/usr/lib/postgresql/${PG_VERSION_MAJOR}/bin/pg_config"
 
 ######################
 # pgvector
@@ -219,13 +163,9 @@ COPY --from=builder-pg_ivm /tmp/pg_ivm/*.so /usr/lib/postgresql/${PG_VERSION_MAJ
 COPY --from=builder-pg_ivm /tmp/pg_ivm/*.control /usr/share/postgresql/${PG_VERSION_MAJOR}/extension/
 COPY --from=builder-pg_ivm /tmp/pg_ivm/*.sql /usr/share/postgresql/${PG_VERSION_MAJOR}/extension/
 
-# Copy the ParadeDB extensions from their builder stages
+# Copy the ParadeDB extension from its builder stage
 COPY --from=builder-pg_search /tmp/target/release/pg_search-pg${PG_VERSION_MAJOR}/usr/lib/postgresql/${PG_VERSION_MAJOR}/lib/* /usr/lib/postgresql/${PG_VERSION_MAJOR}/lib/
 COPY --from=builder-pg_search /tmp/target/release/pg_search-pg${PG_VERSION_MAJOR}/usr/share/postgresql/${PG_VERSION_MAJOR}/extension/* /usr/share/postgresql/${PG_VERSION_MAJOR}/extension/
-COPY --from=builder-pg_analytics /tmp/pg_analytics/target/release/pg_analytics-pg${PG_VERSION_MAJOR}/usr/lib/postgresql/${PG_VERSION_MAJOR}/lib/* /usr/lib/postgresql/${PG_VERSION_MAJOR}/lib/
-COPY --from=builder-pg_analytics /tmp/pg_analytics/target/release/pg_analytics-pg${PG_VERSION_MAJOR}/usr/share/postgresql/${PG_VERSION_MAJOR}/extension/* /usr/share/postgresql/${PG_VERSION_MAJOR}/extension/
-COPY --from=builder-pg_parquet /tmp/pg_parquet/target/release/pg_parquet-pg${PG_VERSION_MAJOR}/usr/lib/postgresql/${PG_VERSION_MAJOR}/lib/* /usr/lib/postgresql/${PG_VERSION_MAJOR}/lib/
-COPY --from=builder-pg_parquet /tmp/pg_parquet/target/release/pg_parquet-pg${PG_VERSION_MAJOR}/usr/share/postgresql/${PG_VERSION_MAJOR}/extension/* /usr/share/postgresql/${PG_VERSION_MAJOR}/extension/
 
 # Install Barman Cloud and its dependencies for Azure, Google, and AWS via `pip`, and clean up after the installation to
 # minimize the size of the image. These are required for enabling Postgres backups in our CloudNativePG deployments.
@@ -242,7 +182,7 @@ RUN apt-get update && \
     find /var/log -type f -exec truncate --size 0 {} \;
 
 # Install Postgis and ca-certificates
-# ca-certificates required for TLS connection to PostHog (which is used for telemetry) and PostGIS
+# ca-certificates required for PostGIS
 ENV POSTGIS_VERSION_MAJOR=3
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -259,7 +199,7 @@ RUN apt-get update \
 # The `postgres` database is the default database that exists in every Postgres installation. The pg_cron
 # extension requires a database to store its metadata tables. By using `postgres`, we ensure that it has a
 # stable, always-available database for its operations, no matter what other databases are created or deleted.
-RUN sed -i "s/^#shared_preload_libraries = ''/shared_preload_libraries = 'pg_search,pg_analytics,pg_parquet,pg_cron'/" /usr/share/postgresql/postgresql.conf.sample && \
+RUN sed -i "s/^#shared_preload_libraries = ''/shared_preload_libraries = 'pg_search,pg_cron'/" /usr/share/postgresql/postgresql.conf.sample && \
     echo "cron.database_name = 'postgres'" >> /usr/share/postgresql/postgresql.conf.sample
 
 # The pg_search extension requires the ICU library binaries to be installed at runtime. Therefore, we download
@@ -300,5 +240,11 @@ RUN echo "deb http://apt.postgresql.org/pub/repos/apt/ bookworm-pgdg main" | tee
     apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
+# Reset the working directory to the root directory
+WORKDIR /
+
 # Copy ParadeDB bootstrap script to install extensions and configure postgresql.conf
 COPY ./docker/bootstrap.sh /docker-entrypoint-initdb.d/10_bootstrap_paradedb.sh
+
+# Explicitly set non-root user (same as official image default)
+USER postgres

@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -19,8 +19,8 @@ pub mod numeric;
 pub mod string;
 
 use crate::index::fast_fields_helper::{FFHelper, FastFieldType, WhichFastField};
+use crate::index::mvcc::MvccSatisfies;
 use crate::index::reader::index::{SearchIndexReader, SearchResults};
-use crate::index::BlockDirectoryType;
 use crate::nodecast;
 use crate::postgres::customscan::builders::custom_path::CustomPathBuilder;
 use crate::postgres::customscan::builders::custom_state::{
@@ -47,7 +47,7 @@ pub struct FastFieldExecState {
     ffhelper: FFHelper,
 
     slot: *mut pg_sys::TupleTableSlot,
-    strbuf: String,
+    strbuf: Option<String>,
     vmbuff: pg_sys::Buffer,
     which_fast_fields: Vec<WhichFastField>,
     search_results: SearchResults,
@@ -78,7 +78,7 @@ impl FastFieldExecState {
 
             ffhelper: Default::default(),
             slot: std::ptr::null_mut(),
-            strbuf: String::with_capacity(256),
+            strbuf: Some(String::with_capacity(256)),
             vmbuff: pg_sys::InvalidBuffer as pg_sys::Buffer,
             which_fast_fields,
             search_results: Default::default(),
@@ -95,7 +95,7 @@ unsafe fn ff_to_datum(
     score: f32,
     doc_address: DocAddress,
     ff_helper: &mut FFHelper,
-    strbuf: &mut String,
+    strbuf: &mut Option<String>,
     slot: *const pg_sys::TupleTableSlot,
 ) -> Option<pg_sys::Datum> {
     let field_index = which_fast_field.1;
@@ -116,13 +116,21 @@ unsafe fn ff_to_datum(
         which_fast_field,
         WhichFastField::Named(_, FastFieldType::String)
     ) {
-        strbuf.as_str().into_datum()
+        if let Some(s) = strbuf {
+            s.as_str().into_datum()
+        } else {
+            None
+        }
     } else if typid == pg_sys::TEXTOID || typid == pg_sys::VARCHAROID {
         // NB:  we don't actually support text-based fast fields... yet
         // but if we did, we'd want to do it this way
-        ff_helper
-            .string(field_index, doc_address, strbuf)
-            .and_then(|s| strbuf.as_str().into_datum())
+        if let Some(s) = strbuf {
+            ff_helper
+                .string(field_index, doc_address, s)
+                .and_then(|_| s.as_str().into_datum())
+        } else {
+            None
+        }
     } else {
         match ff_helper.value(field_index, doc_address) {
             None => None,
@@ -301,6 +309,12 @@ pub fn is_string_agg_capable_ex(
         // doing a string_agg when there's a limit is always a loss, performance-wise
         return None;
     }
+    if is_all_junk(which_fast_fields) {
+        // if all the fast fields we have are Junk fields, then we're not actually
+        // projecting fast fields
+        return None;
+    }
+
     let mut string_field = None;
     for ff in which_fast_fields.iter().flatten() {
         match ff {
@@ -328,12 +342,25 @@ fn is_numeric_fast_field_capable(state: &PdbScanState) -> bool {
         return false;
     }
 
+    if is_all_junk(&state.which_fast_fields) {
+        // if all the fast fields we have are Junk fields, then we're not actually
+        // projecting fast fields
+        return false;
+    }
+
     for ff in state.which_fast_fields.iter().flatten() {
         if matches!(ff, WhichFastField::Named(_, FastFieldType::String)) {
             return false;
         }
     }
     true
+}
+
+fn is_all_junk(which_fast_fields: &Option<Vec<WhichFastField>>) -> bool {
+    which_fast_fields
+        .iter()
+        .flatten()
+        .all(|ff| matches!(ff, WhichFastField::Junk(_)))
 }
 
 /// Add nodes to `EXPLAIN` output to describe the "fast fields" being used by the query, if any
@@ -356,7 +383,7 @@ pub fn explain(state: &CustomScanStateWrapper<PdbScan>, explainer: &mut Explaine
 }
 
 pub fn estimate_cardinality(indexrel: &PgRelation, field: &str) -> Option<usize> {
-    let reader = SearchIndexReader::open(indexrel, BlockDirectoryType::Mvcc, false)
+    let reader = SearchIndexReader::open(indexrel, MvccSatisfies::Snapshot)
         .expect("estimate_cardinality: should be able to open SearchIndexReader");
     let searcher = reader.searcher();
     let largest_segment_reader = searcher

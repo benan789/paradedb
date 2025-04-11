@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -15,16 +15,20 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 
-use super::block::{bm25_max_free_space, BM25PageSpecialData, LinkedList, LinkedListData};
+use super::block::{
+    bm25_max_free_space, BM25PageSpecialData, LinkedList, LinkedListData, FIXED_BLOCK_NUMBERS,
+};
 use crate::postgres::storage::blocklist;
 use crate::postgres::storage::buffer::{BufferManager, PageHeaderMethods};
 use anyhow::Result;
 use pgrx::pg_sys::BlockNumber;
 use pgrx::{check_for_interrupts, pg_sys};
 use std::cmp::min;
+use std::fmt::Debug;
 use std::io::{Cursor, Read, Write};
 use std::ops::{Deref, Range};
 use std::sync::OnceLock;
+
 // ---------------------------------------------------------------
 // Linked list implementation over block storage,
 // where each node is a page filled with bm25_max_free_space()
@@ -260,24 +264,32 @@ impl LinkedBytesList {
         bytes
     }
 
-    pub unsafe fn mark_deleted(&mut self) {
+    /// Return all the allocated blocks used by this [`LinkedBytesList`] back to the
+    /// Free Space Map behind this index.
+    ///
+    /// It's the caller's responsibility to later call [`pg_sys::IndexFreeSpaceMapVacuum`]
+    /// if necessary.
+    pub unsafe fn return_to_fsm(mut self) {
         // in addition to the list itself, we also have a secondary list of linked blocks (which
         // contain the blocknumbers of this list) that needs to be marked deleted too
         for starting_blockno in [self.metadata.start_blockno, self.metadata.blocklist_start] {
             let mut blockno = starting_blockno;
             while blockno != pg_sys::InvalidBlockNumber {
+                assert!(
+                    blockno > *FIXED_BLOCK_NUMBERS.last().unwrap(),
+                    "mark_deleted:  blockno {blockno} cannot ever be recycled"
+                );
                 let mut buffer = self.bman.get_buffer_mut(blockno);
                 let page = buffer.page_mut();
                 let special = page.special::<BM25PageSpecialData>();
 
                 blockno = special.next_blockno;
-                page.mark_deleted();
+                buffer.return_to_fsm(&mut self.bman);
             }
         }
 
-        let mut header_buffer = self.bman.get_buffer_mut(self.header_blockno);
-        let lock_page = header_buffer.page_mut();
-        lock_page.mark_deleted();
+        let header_buffer = self.bman.get_buffer_mut(self.header_blockno);
+        header_buffer.return_to_fsm(&mut self.bman);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -412,9 +424,9 @@ mod tests {
         let mut linked_list = LinkedBytesList::create(relation_oid);
         let bytes: Vec<u8> = (1..=255).cycle().take(100_000).collect();
         linked_list.write(&bytes).unwrap();
-        linked_list.mark_deleted();
-
         let mut blockno = linked_list.get_start_blockno();
+        linked_list.return_to_fsm();
+
         while blockno != pg_sys::InvalidBlockNumber {
             let buffer = BM25BufferCache::open(relation_oid)
                 .get_buffer(blockno, Some(pg_sys::BUFFER_LOCK_SHARE));

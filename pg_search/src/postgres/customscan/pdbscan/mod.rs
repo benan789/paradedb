@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -29,10 +29,8 @@ use crate::api::operator::{
     anyelement_query_input_opoid, attname_from_var, estimate_selectivity, find_var_relation,
 };
 use crate::api::{AsCStr, AsInt, Cardinality};
-use crate::index::merge_policy::AllowedMergePolicy;
-use crate::index::mvcc::MVCCDirectory;
+use crate::index::mvcc::{MVCCDirectory, MvccSatisfies};
 use crate::index::reader::index::SearchIndexReader;
-use crate::index::BlockDirectoryType;
 use crate::postgres::customscan::builders::custom_path::{
     CustomPathBuilder, Flags, OrderByStyle, RestrictInfoType, SortDirection,
 };
@@ -45,6 +43,7 @@ use crate::postgres::customscan::explainer::Explainer;
 use crate::postgres::customscan::pdbscan::exec_methods::fast_fields::{
     estimate_cardinality, is_string_agg_capable_ex,
 };
+use crate::postgres::customscan::pdbscan::parallel::list_segment_ids;
 use crate::postgres::customscan::pdbscan::privdat::PrivateData;
 use crate::postgres::customscan::pdbscan::projections::score::{
     is_score_func, score_funcoid, uses_scores,
@@ -122,12 +121,12 @@ impl CustomScan for PdbScan {
 
             let root = builder.args().root;
 
-            let directory = MVCCDirectory::snapshot(bm25_index.oid(), AllowedMergePolicy::None);
+            let directory = MVCCDirectory::snapshot(bm25_index.oid());
             let index = Index::open(directory).expect("custom_scan: should be able to open index");
             let schema = SearchIndexSchema::open(index.schema(), &bm25_index);
             let pathkey = pullup_orderby_pathkey(&mut builder, rti, &schema, root);
 
-            #[cfg(any(feature = "pg13", feature = "pg14", feature = "pg15"))]
+            #[cfg(any(feature = "pg14", feature = "pg15"))]
             let baserels = (*builder.args().root).all_baserels;
             #[cfg(any(feature = "pg16", feature = "pg17"))]
             let baserels = (*builder.args().root).all_query_rels;
@@ -409,7 +408,7 @@ impl CustomScan for PdbScan {
                 let heaprel = indexrel
                     .heap_relation()
                     .expect("index should belong to a table");
-                let directory = MVCCDirectory::snapshot(indexrel.oid(), AllowedMergePolicy::None);
+                let directory = MVCCDirectory::snapshot(indexrel.oid());
                 let index = Index::open(directory)
                     .expect("create_custom_scan_state: should be able to open index");
                 let schema = SearchIndexSchema::open(index.schema(), &indexrel);
@@ -725,14 +724,22 @@ impl CustomScan for PdbScan {
             .map(|indexrel| unsafe { PgRelation::from_pg(*indexrel) })
             .expect("custom_state.indexrel should already be open");
 
-        let search_reader = SearchIndexReader::open(
-            &indexrel,
-            BlockDirectoryType::Mvcc,
-            state
-                .custom_state()
-                .exec_method()
-                .uses_visibility_map(state.custom_state()),
-        )
+        let search_reader = SearchIndexReader::open(&indexrel, unsafe {
+            if pg_sys::ParallelWorkerNumber == -1 {
+                // the leader only sees snapshot-visible segments
+                MvccSatisfies::Snapshot
+            } else {
+                // the workers have their own rules, which is literally every segment
+                // this is because the workers pick a specific segment to query that
+                // is known to be held open/pinned by the leader but might not pass a ::Snapshot
+                // visibility test due to concurrent merges/garbage collects
+                MvccSatisfies::ParallelWorker(list_segment_ids(
+                    state.custom_state().parallel_state.expect(
+                        "Parallel Custom Scan rescan_custom_scan should have a parallel state",
+                    ),
+                ))
+            }
+        })
         .expect("should be able to open the search index reader");
         state.custom_state_mut().search_reader = Some(search_reader);
 
@@ -798,6 +805,7 @@ impl CustomScan for PdbScan {
                         let slot = match check_visibility(state, ctid, state.scanslot().cast()) {
                             // the ctid is visible
                             Some(slot) => {
+                                exec_method.increment_visible();
                                 state.custom_state_mut().heap_tuple_check_count += 1;
                                 slot
                             }

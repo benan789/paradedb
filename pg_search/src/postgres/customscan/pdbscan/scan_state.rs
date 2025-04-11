@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -211,7 +211,7 @@ impl PdbScanState {
             };
             let mut buffer: pg_sys::Buffer = pg_sys::InvalidBuffer as i32;
 
-            #[cfg(any(feature = "pg13", feature = "pg14"))]
+            #[cfg(feature = "pg14")]
             {
                 if !pg_sys::heap_fetch(heaprel, pg_sys::GetActiveSnapshot(), &mut htup, &mut buffer)
                 {

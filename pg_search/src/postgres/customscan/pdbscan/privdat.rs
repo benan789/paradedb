@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -237,7 +237,7 @@ pub mod serialize {
 
     #[allow(dead_code)]
     pub unsafe fn makeBoolean<T: Into<bool>>(input: Option<T>) -> *mut pg_sys::Node {
-        #[cfg(any(feature = "pg13", feature = "pg14"))]
+        #[cfg(feature = "pg14")]
         {
             unwrapOrNull(
                 input.map(|b| {
@@ -246,7 +246,7 @@ pub mod serialize {
             )
         }
 
-        #[cfg(not(any(feature = "pg13", feature = "pg14")))]
+        #[cfg(not(feature = "pg14"))]
         {
             unwrapOrNull(input.map(|b| pg_sys::makeBoolean(b.into()).cast::<pg_sys::Node>()))
         }

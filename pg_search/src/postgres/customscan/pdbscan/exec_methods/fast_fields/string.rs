@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -74,7 +74,7 @@ impl ExecMethod for StringFastFieldExecState {
     fn query(&mut self, state: &mut PdbScanState) -> bool {
         if let Some(parallel_state) = state.parallel_state {
             if let Some(segment_id) = unsafe { checkout_segment(parallel_state) } {
-                let searcher = StringAggSearcher(state.search_reader.as_ref().unwrap().clone());
+                let searcher = StringAggSearcher(state.search_reader.as_ref().unwrap());
                 self.search_results = searcher.string_agg_by_segment(
                     state.need_scores(),
                     &state.search_query_input,
@@ -92,7 +92,7 @@ impl ExecMethod for StringFastFieldExecState {
             false
         } else {
             // not parallel, first time query
-            let searcher = StringAggSearcher(state.search_reader.as_ref().unwrap().clone());
+            let searcher = StringAggSearcher(state.search_reader.as_ref().unwrap());
             self.search_results =
                 searcher.string_agg(state.need_scores(), &state.search_query_input, &self.field);
             self.inner.did_query = true;
@@ -183,19 +183,22 @@ impl ExecMethod for StringFastFieldExecState {
     }
 }
 
+type SearchResultsIter = std::vec::IntoIter<(SearchIndexScore, DocAddress)>;
+type BatchedResultsIter = std::vec::IntoIter<(Option<String>, SearchResultsIter)>;
+type MergedResultsMap = BTreeMap<Option<String>, Vec<(SearchIndexScore, DocAddress)>>;
 #[derive(Default)]
 enum StringAggResults {
     #[default]
     None,
     Batched {
-        current: (String, std::vec::IntoIter<(SearchIndexScore, DocAddress)>),
-        set: std::vec::IntoIter<(String, std::vec::IntoIter<(SearchIndexScore, DocAddress)>)>,
+        current: (Option<String>, SearchResultsIter),
+        set: BatchedResultsIter,
     },
-    SingleSegment(crossbeam::channel::IntoIter<(SearchIndexScore, DocAddress, String)>),
+    SingleSegment(crossbeam::channel::IntoIter<(SearchIndexScore, DocAddress, Option<String>)>),
 }
 
 impl Iterator for StringAggResults {
-    type Item = (SearchIndexScore, DocAddress, String);
+    type Item = (SearchIndexScore, DocAddress, Option<String>);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -214,9 +217,9 @@ impl Iterator for StringAggResults {
     }
 }
 
-struct StringAggSearcher(SearchIndexReader);
+struct StringAggSearcher<'a>(&'a SearchIndexReader);
 
-impl StringAggSearcher {
+impl StringAggSearcher<'_> {
     pub fn string_agg(
         &self,
         need_scores: bool,
@@ -253,14 +256,14 @@ impl StringAggSearcher {
         let field = field.to_string();
         let searcher = self.0.searcher().clone();
 
-        let merged: Mutex<BTreeMap<String, Vec<(SearchIndexScore, DocAddress)>>> =
-            Mutex::new(BTreeMap::new());
+        let merged: Mutex<MergedResultsMap> = Mutex::new(BTreeMap::new());
 
         results
             .into_par_iter()
             .for_each(|(str_ff, segment_results)| {
                 let keys = segment_results.keys().cloned().collect::<Vec<_>>();
-                let mut values = segment_results.into_iter();
+                let segment_values: Vec<_> = segment_results.into_iter().collect();
+                let mut values_iter = segment_values.into_iter();
                 let mut resolved = FxHashMap::default();
                 str_ff
                     .dictionary()
@@ -271,16 +274,28 @@ impl StringAggSearcher {
 
                         resolved.insert(
                             term,
-                            values.next().unwrap_or_else(|| panic!("internal error: don't have the same number of TermOrd keys and values")).1,
+                            values_iter.next().unwrap_or_else(|| panic!("internal error: don't have the same number of TermOrd keys and values")).1,
                         );
 
                         Ok(())
                     })
                     .expect("term ord resolution should succeed");
 
+                let mut null_results = Vec::new();
+                if str_ff.num_terms() == 0 {
+                    if let Some(next_value) = values_iter.next() {
+                        null_results.push(next_value);
+                        // Collect any additional remaining values
+                        null_results.extend(values_iter);
+                    }
+                }
                 let mut guard = merged.lock();
                 for (term, mut results) in resolved {
-                    guard.entry(term).or_default().append(&mut results);
+                    guard.entry(Some(term)).or_default().append(&mut results);
+                }
+
+                for (_, mut results) in null_results {
+                    guard.entry(None).or_default().append(&mut results);
                 }
             });
 
@@ -291,7 +306,7 @@ impl StringAggSearcher {
             .collect::<Vec<_>>()
             .into_iter();
         StringAggResults::Batched {
-            current: (String::default(), vec![].into_iter()),
+            current: (None, vec![].into_iter()),
             set,
         }
     }
@@ -356,7 +371,7 @@ impl StringAggSearcher {
                 });
                 for (scored, doc_address) in values {
                     sender
-                        .send((scored, doc_address, term.clone()))
+                        .send((scored, doc_address, Some(term.clone())))
                         .map_err(|_| {
                             std::io::Error::new(std::io::ErrorKind::Other, "failed to send term")
                         })?;
@@ -365,6 +380,17 @@ impl StringAggSearcher {
                 Ok(())
             })
             .expect("term ord lookup should succeed");
+
+        if dictionary.num_terms() == 0 && results.len() > 0 {
+            let (_, values) = results.next().unwrap_or_else(|| {
+                panic!("internal error: don't have the same number of TermOrd keys and values")
+            });
+            for (scored, doc_address) in values {
+                let _ = sender.send((scored, doc_address, None)).map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Other, "failed to send term")
+                });
+            }
+        }
 
         StringAggResults::SingleSegment(receiver.into_iter())
     }
@@ -432,13 +458,17 @@ mod term_ord_collector {
         );
 
         fn collect(&mut self, doc: DocId, score: Score) {
+            let doc_address = DocAddress::new(self.segment_ord, doc);
+            let ctid = self.ctid_ff.as_u64(doc).expect("ctid should be present");
+            let scored = SearchIndexScore::new(ctid, score);
             if let Some(term_ord) = self.ff.term_ords(doc).next() {
-                let doc_address = DocAddress::new(self.segment_ord, doc);
-                let ctid = self.ctid_ff.as_u64(doc).expect("ctid should be present");
-                let scored = SearchIndexScore::new(ctid, score);
-
                 self.results
                     .entry(term_ord)
+                    .or_default()
+                    .push((scored, doc_address));
+            } else {
+                self.results
+                    .entry(0)
                     .or_default()
                     .push((scored, doc_address));
             }

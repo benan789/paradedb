@@ -14,23 +14,27 @@ on:
     branches:
       - dev
     paths:
+      - ".github/workflows/benchmark-pg_search.yml"
       - "**/*.rs"
       - "**/*.toml"
   workflow_dispatch:
 
+# - New commits to a feature branch PR cancel previous runs.
+# - Pushes to `dev` get grouped under "dev".
+# - A PR from `dev` to `main` uses the same key as pushes to `dev`, avoiding duplicate runs when doing a promotion.
 concurrency:
-  group: benchmark-pg_search-${{ github.head_ref || github.ref }}
+  group: benchmark-pg_search-${{ (github.event_name == 'push' || github.event.pull_request.head.ref == 'dev') && 'dev' || github.event.pull_request.number }}
   cancel-in-progress: true
 
 jobs:
   benchmark-pg_search:
     name: Benchmark pg_search
+    runs-on: ubicloud-standard-8
+    if: github.event.pull_request.draft == false
     strategy:
       matrix:
-        runner: [ubicloud-standard-8]
         pg_version: [17]
         num_rows: [100000000]
-    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Checkout Git Repository
@@ -44,7 +48,6 @@ jobs:
           wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
           sudo sh -c 'echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
           sudo apt-get update && sudo apt-get install -y postgresql-${{ matrix.pg_version }} postgresql-server-dev-${{ matrix.pg_version }}
-          sudo chown -R $(whoami) /usr/share/postgresql/${{ matrix.pg_version }}/ /usr/lib/postgresql/${{ matrix.pg_version }}/ /var/lib/postgresql/${{ matrix.pg_version }}/
           echo "/usr/lib/postgresql/${{ matrix.pg_version }}/bin" >> $GITHUB_PATH
 
       - name: Extract pgrx Version
@@ -68,7 +71,7 @@ jobs:
         run: |
           cargo install -j $(nproc) --locked cargo-pgrx --version ${{ steps.pgrx.outputs.version }} --debug
           cargo pgrx init --pg${{ matrix.pg_version }}=/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config
-          cargo pgrx install --pg-config="/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config" --release
+          cargo pgrx install --sudo --release --pg-config="/usr/lib/postgresql/${{ matrix.pg_version }}/bin/pg_config"
 
       - name: Configure PostgreSQL settings
         working-directory: /home/runner/.pgrx/data-${{ matrix.pg_version }}/
@@ -93,40 +96,16 @@ jobs:
 
       - name: Run Benchmark
         working-directory: benchmarks/
-        run: cargo run -- --url postgresql://localhost:288${{ matrix.pg_version }}/postgres --rows ${{ matrix.num_rows }} --type pg_search
+        run: cargo run -- --url postgresql://localhost:288${{ matrix.pg_version }}/postgres --rows ${{ matrix.num_rows }} --type pg_search --output csv
 
-      - name: Get PostgreSQL Settings
-        id: get_settings
-        run: |
-          maintenance_work_mem=$(psql postgresql://localhost:288${{ matrix.pg_version }}/postgres -t -c "SHOW maintenance_work_mem;" | tr -d ' ')
-          shared_buffers=$(psql postgresql://localhost:288${{ matrix.pg_version }}/postgres -t -c "SHOW shared_buffers;" | tr -d ' ')
-          max_parallel_workers=$(psql postgresql://localhost:288${{ matrix.pg_version }}/postgres -t -c "SHOW max_parallel_workers;" | tr -d ' ')
-          max_worker_processes=$(psql postgresql://localhost:288${{ matrix.pg_version }}/postgres -t -c "SHOW max_worker_processes;" | tr -d ' ')
-          max_parallel_workers_per_gather=$(psql postgresql://localhost:288${{ matrix.pg_version }}/postgres -t -c "SHOW max_parallel_workers_per_gather;" | tr -d ' ')
-
-          echo "maintenance_work_mem=$maintenance_work_mem" >> $GITHUB_OUTPUT
-          echo "shared_buffers=$shared_buffers" >> $GITHUB_OUTPUT
-          echo "max_parallel_workers=$max_parallel_workers" >> $GITHUB_OUTPUT
-          echo "max_worker_processes=$max_worker_processes" >> $GITHUB_OUTPUT
-          echo "max_parallel_workers_per_gather=$max_parallel_workers_per_gather" >> $GITHUB_OUTPUT
-
-      - name: Create PR Comment
-        if: github.event_name == 'pull_request'
+      - name: Upload Benchmark Results to Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_BENCHMARKS_CHANNEL_WEBHOOK_URL }}
         working-directory: benchmarks/
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          COMMENT=$(cat results_pg_search.md)
-          gh pr comment ${{ github.event.pull_request.number }} --body "$COMMENT"
-
-      - name: Send Slack Notification
-        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        run: |
-          PR_URL="${{ github.event.pull_request.html_url }}"
-          SLACK_MESSAGE="New pg_search benchmark results available on dev branch. View the PR: $PR_URL"
-
-          curl -X POST -H 'Content-type: application/json' \
-            --data "{\"text\":\"$SLACK_MESSAGE\"}" \
-            $SLACK_WEBHOOK_URL
+          for file in results_pg_search_{test_info,index_creation,benchmark_results,postgres_settings}.csv; do
+            curl -F "file=@$file" \
+              -F "channels=${{ secrets.SLACK_BENCHMARKS_CHANNEL_ID }}" \
+              -H "Authorization: Bearer ${{ secrets.SLACK_OAUTH_TOKEN }}" \
+              https://slack.com/api/files.upload
+          done

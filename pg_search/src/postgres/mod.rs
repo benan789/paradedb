@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -15,9 +15,11 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
 #![allow(unpredictable_function_pointer_comparisons)]
+
 use crate::postgres::parallel::Spinlock;
 use crate::query::SearchQueryInput;
 use pgrx::*;
+use std::collections::HashSet;
 use std::io::Write;
 use tantivy::index::SegmentId;
 use tantivy::SegmentReader;
@@ -25,7 +27,7 @@ use tantivy::SegmentReader;
 mod build;
 mod cost;
 mod delete;
-mod insert;
+pub mod insert;
 pub mod options;
 mod range;
 mod scan;
@@ -199,6 +201,7 @@ impl ParallelScanPayload {
 pub struct ParallelScanState {
     mutex: Spinlock,
     remaining_segments: usize,
+    nsegments: usize,
     payload: ParallelScanPayload, // must be last field, b/c it allocates on the heap after this struct
 }
 
@@ -215,8 +218,10 @@ impl ParallelScanState {
     }
 
     fn init_without_mutex(&mut self, segments: &[SegmentReader], query: &[u8]) {
+        assert!(!segments.is_empty());
         self.payload.init(segments, query);
         self.remaining_segments = segments.len();
+        self.nsegments = segments.len();
     }
 
     fn init_mutex(&mut self) {
@@ -234,6 +239,14 @@ impl ParallelScanState {
     pub fn decrement_remaining_segments(&mut self) -> usize {
         self.remaining_segments -= 1;
         self.remaining_segments
+    }
+
+    pub fn segments(&self) -> HashSet<SegmentId> {
+        let mut segments = HashSet::new();
+        for i in 0..self.nsegments {
+            segments.insert(self.segment_id(i));
+        }
+        segments
     }
 
     fn segment_id(&self, i: usize) -> SegmentId {

@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -515,4 +515,138 @@ fn cte_issue_1951(mut conn: PgConnection) {
         order by cte.score desc;    
     "#.fetch_result::<(i32, )>(&mut conn).expect("query failed");
     assert_eq!(results.len(), 1);
+}
+
+#[rstest]
+fn is_numeric_fast_field_capable(mut conn: PgConnection) {
+    r#"
+        CREATE TABLE test (
+            id SERIAL8 NOT NULL PRIMARY KEY,
+            message TEXT,
+            severity INTEGER
+        ) WITH (autovacuum_enabled = false);
+        
+        INSERT INTO test (message, severity) VALUES ('beer wine cheese a', 1);
+        INSERT INTO test (message, severity) VALUES ('beer wine a', 2);
+        INSERT INTO test (message, severity) VALUES ('beer cheese a', 3);
+        INSERT INTO test (message, severity) VALUES ('beer a', 4);
+        INSERT INTO test (message, severity) VALUES ('wine cheese a', 5);
+        INSERT INTO test (message, severity) VALUES ('wine a', 6);
+        INSERT INTO test (message, severity) VALUES ('cheese a', 7);
+        INSERT INTO test (message, severity) VALUES ('beer wine cheese a', 1);
+        INSERT INTO test (message, severity) VALUES ('beer wine a', 2);
+        INSERT INTO test (message, severity) VALUES ('beer cheese a', 3);
+        INSERT INTO test (message, severity) VALUES ('beer a', 4);
+        INSERT INTO test (message, severity) VALUES ('wine cheese a', 5);
+        INSERT INTO test (message, severity) VALUES ('wine a', 6);
+        INSERT INTO test (message, severity) VALUES ('cheese a', 7);
+        
+        -- INSERT INTO test (message) SELECT 'space fillter ' || x FROM generate_series(1, 10000000) x;
+        
+        CREATE INDEX idxtest ON test USING bm25(id, message, severity) WITH (key_field = 'id');
+        CREATE OR REPLACE FUNCTION assert(a bigint, b bigint) RETURNS bool STABLE STRICT LANGUAGE plpgsql AS $$
+        DECLARE
+            current_txid bigint;
+        BEGIN
+            -- Get the current transaction ID
+            current_txid := txid_current();
+        
+            -- Check if the values are not equal
+            IF a <> b THEN
+                RAISE EXCEPTION 'Assertion failed: % <> %. Transaction ID: %', a, b, current_txid;
+            END IF;
+        
+            RETURN true;
+        END;
+        $$;    
+    "#.execute(&mut conn);
+
+    "VACUUM test;".execute(&mut conn);
+
+    r#"
+        SET enable_indexonlyscan to OFF;
+        SET enable_indexscan to OFF;
+    "#
+    .execute(&mut conn);
+
+    let (b, count) = "select assert(count(*), 8), count(*) from (select id from test where message @@@ 'beer' order by severity) x limit 8;".fetch_one::<(bool, i64)>(&mut conn);
+    assert_eq!((b, count), (true, 8));
+}
+
+#[rstest]
+fn top_n_matches(mut conn: PgConnection) {
+    r#"
+        DROP TABLE IF EXISTS test;
+        CREATE TABLE test (
+            id SERIAL8 NOT NULL PRIMARY KEY,
+            message TEXT,
+            severity INTEGER
+        ) WITH (autovacuum_enabled = false);
+        
+        INSERT INTO test (message, severity) VALUES ('beer wine cheese a', 1);
+        INSERT INTO test (message, severity) VALUES ('beer wine a', 2);
+        INSERT INTO test (message, severity) VALUES ('beer cheese a', 3);
+        INSERT INTO test (message, severity) VALUES ('beer a', 4);
+        INSERT INTO test (message, severity) VALUES ('wine cheese a', 5);
+        INSERT INTO test (message, severity) VALUES ('wine a', 6);
+        INSERT INTO test (message, severity) VALUES ('cheese a', 7);
+        INSERT INTO test (message, severity) VALUES ('beer wine cheese a', 1);
+        INSERT INTO test (message, severity) VALUES ('beer wine a', 2);
+        INSERT INTO test (message, severity) VALUES ('beer cheese a', 3);
+        INSERT INTO test (message, severity) VALUES ('beer a', 4);
+        INSERT INTO test (message, severity) VALUES ('wine cheese a', 5);
+        INSERT INTO test (message, severity) VALUES ('wine a', 6);
+        INSERT INTO test (message, severity) VALUES ('cheese a', 7);
+        
+        -- INSERT INTO test (message) SELECT 'space fillter ' || x FROM generate_series(1, 10000000) x;
+        
+        CREATE INDEX idxtest ON test USING bm25(id, message, severity) WITH (key_field = 'id');
+        CREATE OR REPLACE FUNCTION assert(a bigint, b bigint) RETURNS bool STABLE STRICT LANGUAGE plpgsql AS $$
+        DECLARE
+            current_txid bigint;
+        BEGIN
+            -- Get the current transaction ID
+            current_txid := txid_current();
+        
+            -- Check if the values are not equal
+            IF a <> b THEN
+                RAISE EXCEPTION 'Assertion failed: % <> %. Transaction ID: %', a, b, current_txid;
+            END IF;
+        
+            RETURN true;
+        END;
+        $$;    
+    "#.execute(&mut conn);
+
+    "UPDATE test SET severity = (floor(random() * 10) + 1)::int WHERE id < 10;".execute(&mut conn);
+    "UPDATE test SET severity = (floor(random() * 10) + 1)::int WHERE id < 10;".execute(&mut conn);
+    "UPDATE test SET severity = (floor(random() * 10) + 1)::int WHERE id < 10;".execute(&mut conn);
+
+    r#"
+        SET enable_indexonlyscan to OFF;
+        SET enable_indexscan to OFF;
+        SET max_parallel_workers = 0;
+    "#
+    .execute(&mut conn);
+
+    for n in 1..=100 {
+        let sql = format!("select assert(count(*), LEAST({n}, 8)), count(*) from (select id from test where message @@@ 'beer' order by severity limit {n}) x;");
+
+        let (b, count) = sql.fetch_one::<(bool, i64)>(&mut conn);
+        assert_eq!((b, count), (true, n.min(8)));
+    }
+
+    r#"
+        SET enable_indexonlyscan to OFF;
+        SET enable_indexscan to OFF;
+        SET max_parallel_workers = 32;
+    "#
+    .execute(&mut conn);
+
+    for n in 1..=100 {
+        let sql = format!("select assert(count(*), LEAST({n}, 8)), count(*) from (select id from test where message @@@ 'beer' order by severity limit {n}) x;");
+
+        let (b, count) = sql.fetch_one::<(bool, i64)>(&mut conn);
+        assert_eq!((b, count), (true, n.min(8)));
+    }
 }

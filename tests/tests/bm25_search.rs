@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -377,6 +377,24 @@ fn snippet(mut conn: PgConnection) {
     assert_eq!(row.0, 3);
     assert_eq!(row.1, "Sleek running <h1>shoes</h1>");
     assert_relative_eq!(row.2, 2.484906, epsilon = 1e-6);
+
+    let row: (i32, String, f32) = "
+        SELECT id, paradedb.snippet(description, max_num_chars=>14), paradedb.score(id)
+        FROM paradedb.bm25_search WHERE bm25_search @@@ 'description:keyboard' ORDER BY id;"
+        .fetch_one(&mut conn);
+
+    assert_eq!(row.0, 1);
+    assert_eq!(row.1, "metal <b>keyboard</b>");
+    assert_relative_eq!(row.2, 2.821378, epsilon = 1e-6);
+
+    let row: (i32, String, f32) = "
+        SELECT id, paradedb.snippet(description, max_num_chars=>17), paradedb.score(id)
+        FROM paradedb.bm25_search WHERE bm25_search @@@ 'description:shoes' ORDER BY score DESC"
+        .fetch_one(&mut conn);
+
+    assert_eq!(row.0, 5);
+    assert_eq!(row.1, "Generic <b>shoes</b>");
+    assert_relative_eq!(row.2, 2.877_26, epsilon = 1e-6);
 }
 
 #[rstest]

@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -14,6 +14,7 @@
 //
 // You should have received a copy of the GNU Affero General Public License
 // along with this program. If not, see <http://www.gnu.org/licenses/>.
+#![recursion_limit = "512"]
 #![allow(unexpected_cfgs)]
 
 mod api;
@@ -23,10 +24,7 @@ mod postgres;
 mod query;
 mod schema;
 
-#[cfg(test)]
-pub mod github;
 pub mod gucs;
-pub mod telemetry;
 
 use self::postgres::customscan;
 use pgrx::*;
@@ -51,6 +49,7 @@ extension_sql!(
 );
 
 use once_cell::sync::Lazy;
+use rand::Rng;
 use std::sync::Mutex;
 
 /// For debugging
@@ -72,11 +71,18 @@ pub fn MyDatabaseId() -> u32 {
     }
 }
 
-/// Initializes option parsing and telemetry
+/// Initializes option parsing
 #[allow(clippy::missing_safety_doc)]
 #[allow(non_snake_case)]
 #[pg_guard]
 pub unsafe extern "C" fn _PG_init() {
+    // initialize environment logging (to stderr) for dependencies that do logging
+    // we can't implement our own logger that sends messages to Postgres `ereport()` because
+    // of threading concerns
+    std::env::set_var("RUST_LOG", "warn");
+    std::env::set_var("RUST_LOG_STYLE", "never");
+    env_logger::init();
+
     if cfg!(not(feature = "pg17")) && !pg_sys::process_shared_preload_libraries_in_progress {
         error!("pg_search must be loaded via shared_preload_libraries. Add 'pg_search' to shared_preload_libraries in postgresql.conf and restart Postgres.");
     }
@@ -87,17 +93,33 @@ pub unsafe extern "C" fn _PG_init() {
     #[cfg(not(feature = "pg17"))]
     postgres::fake_aminsertcleanup::register();
 
-    if cfg!(feature = "telemetry") {
-        use telemetry::setup_telemetry_background_worker;
-
-        setup_telemetry_background_worker(telemetry::ParadeExtension::PgSearch);
-    }
-
-    // Register our tracing / logging hook, so that we can ensure that the logger
-    // is initialized for all connections.
     #[allow(static_mut_refs)]
     #[allow(deprecated)]
     customscan::register_rel_pathlist(customscan::pdbscan::PdbScan);
+}
+
+#[pg_extern]
+fn random_words(num_words: i32) -> String {
+    let mut rng = rand::thread_rng();
+    let letters = "abcdefghijklmnopqrstuvwxyz";
+    let mut result = String::new();
+
+    for _ in 0..num_words {
+        // Choose a random word length between 3 and 7.
+        let word_length = rng.gen_range(3..=7);
+        let mut word = String::new();
+
+        for _ in 0..word_length {
+            // Pick a random letter from the letters string.
+            let random_index = rng.gen_range(0..letters.len());
+            // Safe to use .unwrap() because the index is guaranteed to be valid.
+            let letter = letters.chars().nth(random_index).unwrap();
+            word.push(letter);
+        }
+        result.push_str(&word);
+        result.push(' ');
+    }
+    result.trim_end().to_string()
 }
 
 /// This module is required by `cargo pgrx test` invocations.

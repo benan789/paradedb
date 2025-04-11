@@ -1,4 +1,6 @@
-use crate::postgres::storage::block::{BM25PageSpecialData, PgItem};
+use crate::postgres::storage::block::{
+    bm25_max_free_space, BM25PageSpecialData, PgItem, FIXED_BLOCK_NUMBERS,
+};
 use crate::postgres::storage::utils::{BM25BufferCache, BM25Page};
 use pgrx::pg_sys;
 
@@ -11,6 +13,7 @@ impl Drop for Buffer {
     fn drop(&mut self) {
         unsafe {
             if self.pg_buffer != pg_sys::InvalidBuffer as pg_sys::Buffer
+                && pg_sys::InterruptHoldoffCount > 0    // if it's not we're likely unwinding the stack due to a panic and unlocking buffers isn't possible anymore
                 && crate::postgres::utils::IsTransactionState()
             {
                 pg_sys::UnlockReleaseBuffer(self.pg_buffer);
@@ -23,18 +26,6 @@ impl Buffer {
     fn new(pg_buffer: pg_sys::Buffer) -> Self {
         assert!(pg_buffer != pg_sys::InvalidBuffer as pg_sys::Buffer);
         Self { pg_buffer }
-    }
-
-    #[allow(dead_code)]
-    pub fn unlock(mut self) -> PinnedBuffer {
-        unsafe {
-            let pg_buffer = self.pg_buffer;
-            self.pg_buffer = pg_sys::InvalidBuffer as pg_sys::Buffer;
-
-            // unlock this buffer and convert to a PinnedBuffer
-            pg_sys::LockBuffer(pg_buffer, pg_sys::BUFFER_LOCK_UNLOCK as _);
-            PinnedBuffer::new(pg_buffer)
-        }
     }
 
     pub fn page(&self) -> Page {
@@ -114,8 +105,25 @@ impl BufferMut {
     pub fn page_size(&self) -> pg_sys::Size {
         self.inner.page_size()
     }
+
+    /// Return this [`BufferMut`] instance back to Postgres' Free Space Map, making
+    /// it available for future reuse as a new buffer.
+    ///
+    /// It's the caller's responsibility to later call [`pg_sys::IndexFreeSpaceMapVacuum`]
+    /// if necessary.
+    pub fn return_to_fsm(mut self, bman: &mut BufferManager) {
+        unsafe {
+            let blockno = self.page_mut().mark_deleted();
+            assert!(
+                blockno > *FIXED_BLOCK_NUMBERS.last().unwrap(),
+                "record_free_index_page: blockno {blockno} cannot ever be recycled"
+            );
+            pg_sys::RecordPageWithFreeSpace(bman.bcache.indexrel(), blockno, bm25_max_free_space());
+        }
+    }
 }
 
+#[derive(Debug)]
 pub struct PinnedBuffer {
     pg_buffer: pg_sys::Buffer,
 }
@@ -159,10 +167,14 @@ impl Page<'_> {
         unsafe { pg_sys::PageGetMaxOffsetNumber(self.pg_page) }
     }
 
-    pub fn read_item<T: From<PgItem>>(
+    pub fn deserialize_item<T: From<PgItem>>(
         &self,
         offno: pg_sys::OffsetNumber,
     ) -> Option<(T, pg_sys::Size)> {
+        unsafe { self.pg_page.deserialize_item(offno) }
+    }
+
+    pub fn read_item(&self, offno: pg_sys::OffsetNumber) -> Option<PgItem> {
         unsafe { self.pg_page.read_item(offno) }
     }
 
@@ -193,10 +205,6 @@ impl Page<'_> {
         unsafe { (pg_sys::PageGetContents(self.pg_page) as *const T).read_unaligned() }
     }
 
-    pub fn is_recyclable(&self, heaprel: pg_sys::Relation) -> bool {
-        unsafe { self.pg_page.recyclable(heaprel) }
-    }
-
     pub fn next_blockno(&self) -> pg_sys::BlockNumber {
         unsafe {
             let special = pg_sys::PageGetSpecialPointer(self.pg_page) as *mut BM25PageSpecialData;
@@ -211,23 +219,39 @@ pub struct PageMut<'a> {
 }
 
 impl PageMut<'_> {
-    pub fn mark_deleted(mut self) {
-        unsafe {
-            self.special_mut::<BM25PageSpecialData>().xmax =
-                pg_sys::ReadNextFullTransactionId().value as pg_sys::TransactionId;
-        }
+    fn mark_deleted(mut self) -> pg_sys::BlockNumber {
+        let blockno = self.buffer.number();
+        let special = self.special_mut::<BM25PageSpecialData>();
+
+        assert!(
+            special.xmax == pg_sys::InvalidTransactionId
+                || special.xmax == pg_sys::FrozenTransactionId,
+            "page {} is already marked deleted with xid={}",
+            blockno,
+            special.xmax
+        );
+        special.xmax = pg_sys::FrozenTransactionId;
         self.buffer.dirty = true;
+        blockno
     }
 
     pub fn max_offset_number(&self) -> pg_sys::OffsetNumber {
         unsafe { pg_sys::PageGetMaxOffsetNumber(self.pg_page) }
     }
 
-    pub fn read_item<T: From<PgItem>>(
+    pub fn mark_item_dead(&mut self, offno: pg_sys::OffsetNumber) {
+        unsafe {
+            let item_id = pg_sys::PageGetItemId(self.pg_page, offno);
+            (*item_id).set_lp_flags(pg_sys::LP_DEAD);
+            self.buffer.dirty = true;
+        }
+    }
+
+    pub fn deserialize_item<T: From<PgItem>>(
         &self,
         offno: pg_sys::OffsetNumber,
     ) -> Option<(T, pg_sys::Size)> {
-        unsafe { self.pg_page.read_item(offno) }
+        unsafe { self.pg_page.deserialize_item(offno) }
     }
 
     pub fn find_item<T: From<PgItem>, F: Fn(T) -> bool>(
@@ -236,7 +260,7 @@ impl PageMut<'_> {
     ) -> Option<pg_sys::OffsetNumber> {
         let max = self.max_offset_number();
         for offno in pg_sys::FirstOffsetNumber as pg_sys::OffsetNumber..=max {
-            let (item, _) = self.read_item::<T>(offno)?;
+            let (item, _) = self.deserialize_item::<T>(offno)?;
             if cmp(item) {
                 return Some(offno);
             }
@@ -421,6 +445,10 @@ impl BufferManager {
         }
     }
 
+    pub fn relation_oid(&self) -> pg_sys::Oid {
+        unsafe { (*self.bcache.indexrel()).rd_id }
+    }
+
     pub fn bm25cache(&self) -> &BM25BufferCache {
         &self.bcache
     }
@@ -462,6 +490,7 @@ impl BufferManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_buffer_conditional(&mut self, blockno: pg_sys::BlockNumber) -> Option<BufferMut> {
         unsafe {
             let pg_buffer = self.bcache.get_buffer(blockno, None);
@@ -477,15 +506,13 @@ impl BufferManager {
         }
     }
 
-    pub fn get_buffer_for_cleanup(
-        &mut self,
-        blockno: pg_sys::BlockNumber,
-        strategy: pg_sys::BufferAccessStrategy,
-    ) -> BufferMut {
+    pub fn get_buffer_for_cleanup(&mut self, blockno: pg_sys::BlockNumber) -> BufferMut {
         unsafe {
-            let buffer = self
-                .bcache
-                .get_buffer_with_strategy(blockno, strategy, None);
+            let buffer = self.bcache.get_buffer_with_strategy(
+                blockno,
+                pg_sys::ReadBufferMode::RBM_NORMAL as _,
+                None,
+            );
             pg_sys::LockBufferForCleanup(buffer);
             BufferMut {
                 dirty: false,
@@ -494,13 +521,25 @@ impl BufferManager {
         }
     }
 
-    pub fn page_is_empty(&self, blockno: pg_sys::BlockNumber) -> bool {
-        self.get_buffer(blockno).page().is_empty()
+    pub fn get_buffer_for_cleanup_conditional(
+        &mut self,
+        blockno: pg_sys::BlockNumber,
+    ) -> Option<BufferMut> {
+        unsafe {
+            let buffer = self.bcache.get_buffer(blockno, None);
+            if pg_sys::ConditionalLockBufferForCleanup(buffer) {
+                Some(BufferMut {
+                    dirty: false,
+                    inner: Buffer::new(buffer),
+                })
+            } else {
+                pg_sys::ReleaseBuffer(buffer);
+                None
+            }
+        }
     }
 
-    pub fn record_free_index_page(&mut self, buffer: Buffer) {
-        unsafe {
-            self.bcache.record_free_index_page(buffer.number());
-        }
+    pub fn page_is_empty(&self, blockno: pg_sys::BlockNumber) -> bool {
+        self.get_buffer(blockno).page().is_empty()
     }
 }

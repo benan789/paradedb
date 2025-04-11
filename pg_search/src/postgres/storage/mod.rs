@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Retake, Inc.
+// Copyright (c) 2023-2025 ParadeDB, Inc.
 //
 // This file is part of ParadeDB - Postgres for Search and Analytics
 //
@@ -95,6 +95,7 @@ mod blocklist;
 pub mod buffer;
 pub mod linked_bytes;
 pub mod linked_items;
+pub mod merge;
 pub mod utils;
 
 pub use self::linked_bytes::LinkedBytesList;
